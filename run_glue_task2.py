@@ -25,7 +25,7 @@ import random
 
 import numpy as np
 import torch
-from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
+from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler, DistributedSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
@@ -71,8 +71,21 @@ def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
     args.train_batch_size = args.per_device_train_batch_size
-    train_sampler = RandomSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+    if args.local_rank == -1:
+        train_sampler = RandomSampler(train_dataset)
+    else:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=args.world_size,
+            rank=args.local_rank,
+            shuffle=True
+        )
+    
+    train_dataloader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        batch_size=args.train_batch_size
+    )
 
     if args.max_steps > 0:
         t_total = args.max_steps
@@ -110,7 +123,9 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for _ in train_iterator:
+    for epoch in train_iterator:
+        if args.local_rank != -1:
+            train_sampler.set_epoch(epoch)
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
             model.train()
@@ -349,13 +364,30 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
+
+    parser.add_argument("--master_ip", type=str, default=None,
+                        help="Master node IP address for distributed training.")
+    parser.add_argument("--master_port", type=str, default=None,
+                        help="Master node port for distributed training.")
+    parser.add_argument("--world_size", type=int, default=1,
+                        help="Number of total workers for distributed training.")
+  
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
     # set up (distributed) training
-    args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    use_cuda = torch.cuda.is_available() and not args.no_cuda
+    if args.local_rank != -1:
+        backend = "nccl" if use_cuda else "gloo"
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method=f"tcp://{args.master_ip}:{args.master_port}",
+            world_size=args.world_size,
+            rank=args.local_rank,
+        )
+    args.device = torch.device("cuda" if use_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
 
     # Setup logging
