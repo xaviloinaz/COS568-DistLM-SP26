@@ -67,6 +67,35 @@ def set_seed(args):
     torch.cuda.manual_seed_all(args.seed)
 
 
+def sync_gradients_gather_scatter(args, model):
+    if args.local_rank == -1:
+        return  # single-process training, nothing to do
+
+    world_size = args.world_size
+    rank = args.local_rank
+
+    for param in model.parameters():
+        if param.grad is None:
+            continue
+
+        grad = param.grad.data
+        recv_grad = torch.zeros_like(grad)
+
+        if rank == 0:
+            gather_list = [torch.zeros_like(grad) for _ in range(world_size)]
+            torch.distributed.gather(grad, gather_list=gather_list, dst=0)
+
+            avg_grad = sum(gather_list) / world_size
+
+            scatter_list = [avg_grad.clone() for _ in range(world_size)]
+            torch.distributed.scatter(recv_grad, scatter_list=scatter_list, src=0)
+        else:
+            torch.distributed.gather(grad, gather_list=None, dst=0)
+            torch.distributed.scatter(recv_grad, scatter_list=None, src=0)
+
+        param.grad.data.copy_(recv_grad)
+
+
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
@@ -149,7 +178,8 @@ def train(args, train_dataset, model, tokenizer):
                 # TODO(cos568): perform backward pass here (expect one line of code)
                 print("Loss:", loss)
                 loss.backward()
-                ##################################################
+                ##################################################\
+                sync_gradients_gather_scatter(args, model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
