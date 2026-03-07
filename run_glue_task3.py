@@ -151,7 +151,6 @@ def train(args, train_dataset, model, tokenizer):
                 print("Loss:", loss)
                 loss.backward()
                 ##################################################\
-                sync_gradients_all_reduce(args, model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
@@ -436,8 +435,14 @@ def main():
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
-
+    
     model.to(args.device)
+    
+    if args.local_rank != -1:
+        if args.device.type == "cuda":
+            model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+        else:
+            model = DDP(model)
 
     logger.info("Training/evaluation parameters %s", args)
 
