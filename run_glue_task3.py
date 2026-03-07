@@ -28,6 +28,7 @@ import torch
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler, DistributedSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm, trange
 
 # import a previous version of the HuggingFace Transformers package
@@ -65,21 +66,7 @@ def set_seed(args):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.cuda.manual_seed_all(args.seed)
-
-
-def sync_gradients_all_reduce(args, model):
-    if args.local_rank == -1:
-        return  # single-process training, nothing to do
-
-    world_size = args.world_size
-
-    for param in model.parameters():
-        if param.grad is None:
-            continue
-
-        torch.distributed.all_reduce(param.grad.data, op=torch.distributed.ReduceOp.SUM)
-        param.grad.data /= world_size
-
+  
 
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
@@ -397,13 +384,20 @@ def main():
     use_cuda = torch.cuda.is_available() and not args.no_cuda
     if args.local_rank != -1:
         backend = "nccl" if use_cuda else "gloo"
+        if use_cuda:
+            torch.cuda.set_device(args.local_rank)
+            args.device = torch.device("cuda", args.local_rank)
+        else:
+            args.device = torch.device("cpu")
+    
         torch.distributed.init_process_group(
             backend=backend,
             init_method=f"tcp://{args.master_ip}:{args.master_port}",
             world_size=args.world_size,
             rank=args.local_rank,
         )
-    args.device = torch.device("cuda" if use_cuda else "cpu")
+    else:
+        args.device = torch.device("cuda" if use_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
 
     # Setup logging
