@@ -29,6 +29,7 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler, Dist
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.profiler
 from tqdm import tqdm, trange
 
 # import a previous version of the HuggingFace Transformers package
@@ -72,6 +73,30 @@ def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
     args.train_batch_size = args.per_device_train_batch_size
+
+    prof = None
+    if args.profile:
+        os.makedirs(args.profile_dir, exist_ok=True)
+    
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if args.device.type == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+    
+        trace_file = os.path.join(
+            args.profile_dir,
+            f"trace_rank{args.local_rank if args.local_rank != -1 else 0}.json"
+        )
+    
+        prof = torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(wait=1, warmup=0, active=3, repeat=1),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+            on_trace_ready=lambda p: p.export_chrome_trace(trace_file)
+        )
+        prof.start()
+  
     if args.local_rank == -1:
         train_sampler = RandomSampler(train_dataset)
     else:
@@ -166,6 +191,10 @@ def train(args, train_dataset, model, tokenizer):
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
+
+            if prof is not None:
+                prof.step()
+              
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
@@ -176,6 +205,9 @@ def train(args, train_dataset, model, tokenizer):
             evaluate(args, model, tokenizer)
         ##################################################
 
+    if prof is not None:
+        prof.stop()
+    
     return global_step, tr_loss / global_step
 
 
@@ -373,6 +405,11 @@ def main():
                         help="Master node port for distributed training.")
     parser.add_argument("--world_size", type=int, default=1,
                         help="Number of total workers for distributed training.")
+
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling.")
+    parser.add_argument("--profile_dir", type=str, default="profiles",
+                        help="Directory to save chrome trace files.")
   
     args = parser.parse_args()
 
